@@ -31,12 +31,21 @@ type stubChecker struct {
 	action    sdk.ScalingAction
 	err       error
 	groupName string
+	callsLock sync.Mutex
 	calls     int
 }
 
 func (s *stubChecker) runCheckAndCapCount(_ context.Context, _ int64, _ *queryMetricsCache) (sdk.ScalingAction, error) {
+	s.callsLock.Lock()
 	s.calls++
+	s.callsLock.Unlock()
 	return s.action, s.err
+}
+
+func (s *stubChecker) callCount() int {
+	s.callsLock.Lock()
+	defer s.callsLock.Unlock()
+	return s.calls
 }
 
 func (s *stubChecker) group() string {
@@ -372,7 +381,7 @@ func TestHandler_calculateNewCount_SentinelErrorsSkipped_UnknownErrorFails(t *te
 				must.Error(t, err)
 				must.ErrorContains(t, err, tc.expectedErrText)
 				for i, runner := range tc.runners {
-					must.Eq(t, tc.expectedCalls[i], runner.calls)
+					must.Eq(t, tc.expectedCalls[i], runner.callCount())
 				}
 				return
 			}
@@ -380,7 +389,7 @@ func TestHandler_calculateNewCount_SentinelErrorsSkipped_UnknownErrorFails(t *te
 			must.NoError(t, err)
 			must.Eq(t, tc.expectedAction, action)
 			for i, runner := range tc.runners {
-				must.Eq(t, tc.expectedCalls[i], runner.calls)
+				must.Eq(t, tc.expectedCalls[i], runner.callCount())
 			}
 		})
 	}

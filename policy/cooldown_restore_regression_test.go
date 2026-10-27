@@ -115,7 +115,7 @@ func TestNewPolicyHandlerRestoredCooldownGatesRun(t *testing.T) {
 				// the handler and any scaling goroutine to finish their work.
 				time.Sleep(handler.policy.EvaluationInterval)
 				synctest.Wait()
-				if check.calls == 0 {
+				if check.callCount() == 0 {
 					t.Fatal("no evaluations observed")
 				}
 				if !time.Now().After(deadline) {
