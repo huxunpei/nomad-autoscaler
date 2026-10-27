@@ -17,7 +17,6 @@ import (
 	"github.com/hashicorp/nomad-autoscaler/sdk"
 	"github.com/shoenig/test"
 	"github.com/shoenig/test/must"
-	"github.com/stretchr/testify/assert"
 )
 
 type MockLimiter struct {
