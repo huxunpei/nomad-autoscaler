@@ -7,25 +7,30 @@ import (
 	"context"
 	"strconv"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad-autoscaler/sdk"
 )
 
-func restoredCooldownHandler(t *testing.T, now time.Time, cooldown time.Duration, meta map[string]string) (*Handler, *mockTargetController) {
+func restoredCooldownHandler(t *testing.T, cooldown, cooldownOnScaleUp time.Duration, meta map[string]string) (*Handler, *mockTargetController) {
 	t.Helper()
 	previousNow := nowFunc
-	nowFunc = func() time.Time { return now }
+	nowFunc = time.Now
 	t.Cleanup(func() { nowFunc = previousNow })
 	target := &mockTargetController{status: &sdk.TargetStatus{Count: 2, Ready: true, Meta: meta}}
 	handler, err := NewPolicyHandler(HandlerConfig{
 		Log: hclog.NewNullLogger(),
 		Policy: &sdk.ScalingPolicy{
-			ID: "cooldown-restore-regression", Type: sdk.ScalingPolicyTypeCluster,
-			Min: 1, Max: 5, EvaluationInterval: 2 * time.Millisecond,
-			Cooldown: cooldown, CooldownOnScaleUp: cooldown,
-			Target: &sdk.ScalingPolicyTarget{Name: "mock-target", Config: map[string]string{}},
+			ID:                 "cooldown-restore-regression",
+			Type:               sdk.ScalingPolicyTypeCluster,
+			Min:                1,
+			Max:                5,
+			EvaluationInterval: time.Second,
+			Cooldown:           cooldown,
+			CooldownOnScaleUp:  cooldownOnScaleUp,
+			Target:             &sdk.ScalingPolicyTarget{Name: "mock-target", Config: map[string]string{}},
 		},
 		TargetController: target,
 	})
@@ -38,19 +43,21 @@ func restoredCooldownHandler(t *testing.T, now time.Time, cooldown time.Duration
 func TestNewPolicyHandlerRestoresCooldownDeadline(t *testing.T) {
 	now := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
 	for _, tc := range []struct {
-		name              string
-		cooldown, elapsed time.Duration
+		name                                 string
+		cooldown, cooldownOnScaleUp, elapsed time.Duration
 	}{
-		{"short", 6 * time.Second, 2 * time.Second},
-		{"five_minutes", 5 * time.Minute, time.Minute},
-		{"expired", 6 * time.Second, 8 * time.Second},
-		{"future_event", 6 * time.Second, -2 * time.Second},
+		{"short", 6 * time.Second, 6 * time.Second, 2 * time.Second},
+		{"five_minutes", 5 * time.Minute, 5 * time.Minute, time.Minute},
+		{"expired", 6 * time.Second, 6 * time.Second, 8 * time.Second},
+		{"future_event", 6 * time.Second, 6 * time.Second, -2 * time.Second},
+		{"shorter_scale_up", time.Minute, 6 * time.Second, 2 * time.Second},
+		{"longer_scale_up", 6 * time.Second, time.Minute, 2 * time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			last := now.Add(-tc.elapsed)
-			handler, _ := restoredCooldownHandler(t, now, tc.cooldown,
+			handler, _ := restoredCooldownHandler(t, tc.cooldown, tc.cooldownOnScaleUp,
 				map[string]string{sdk.TargetStatusMetaKeyLastEvent: strconv.FormatInt(last.UnixNano(), 10)})
-			want := last.Add(tc.cooldown)
+			want := last.Add(tc.cooldownOnScaleUp)
 			if got := handler.getOutOfCooldownOn(); !got.Equal(want) {
 				t.Fatalf("restored cooldown deadline=%s want=%s", got, want)
 			}
@@ -69,7 +76,7 @@ func TestNewPolicyHandlerWithoutPositiveLastEventStaysIdle(t *testing.T) {
 		{"negative", map[string]string{sdk.TargetStatusMetaKeyLastEvent: "-1"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			handler, _ := restoredCooldownHandler(t, time.Now().UTC(), time.Second, tc.meta)
+			handler, _ := restoredCooldownHandler(t, time.Minute, time.Second, tc.meta)
 			if handler.getState() != StateIdle || !handler.getOutOfCooldownOn().IsZero() {
 				t.Fatal("nonpositive/missing/malformed last event unexpectedly restored cooldown")
 			}
@@ -78,40 +85,77 @@ func TestNewPolicyHandlerWithoutPositiveLastEventStaysIdle(t *testing.T) {
 }
 
 func TestNewPolicyHandlerRestoredCooldownGatesRun(t *testing.T) {
-	now := time.Now().UTC()
-	handler, target := restoredCooldownHandler(t, now, time.Minute,
-		map[string]string{sdk.TargetStatusMetaKeyLastEvent: strconv.FormatInt(now.Add(-time.Second).UnixNano(), 10)})
-	check := &stubChecker{action: sdk.ScalingAction{Count: 3, Direction: sdk.ScaleDirectionUp}}
-	handler.checkRunners = []checker{check}
-	handler.limiter = &MockLimiter{}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { defer close(done); handler.Run(ctx) }()
-	time.Sleep(30 * time.Millisecond)
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("handler did not stop")
-	}
-	if check.calls == 0 {
-		t.Fatal("no evaluations observed")
-	}
-	if target.getScaleCalled() {
-		t.Fatal("restored cooldown allowed Scale before its deadline")
-	}
-	if handler.getState() != StateCooldown {
-		t.Fatalf("restored cooldown state=%v", handler.getState())
+	for _, tc := range []struct {
+		name    string
+		elapsed time.Duration
+	}{
+		{"remaining", time.Second},
+		{"already_expired", 6 * time.Second},
+		{"future_event", -2 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const cooldownOnScaleUp = 5 * time.Second
+				last := time.Now().Add(-tc.elapsed)
+				deadline := last.Add(cooldownOnScaleUp)
+				handler, target := restoredCooldownHandler(t, time.Minute, cooldownOnScaleUp,
+					map[string]string{sdk.TargetStatusMetaKeyLastEvent: strconv.FormatInt(last.UnixNano(), 10)})
+				check := &stubChecker{action: sdk.ScalingAction{Count: 3, Direction: sdk.ScaleDirectionUp}}
+				handler.checkRunners = []checker{check}
+				handler.limiter = &MockLimiter{}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer func() {
+					cancel()
+					synctest.Wait()
+				}()
+				go handler.Run(ctx)
+				synctest.Wait()
+
+				// Advance the fake clock to the first evaluation, then wait for
+				// the handler and any scaling goroutine to finish their work.
+				time.Sleep(handler.policy.EvaluationInterval)
+				synctest.Wait()
+				if check.callCount() == 0 {
+					t.Fatal("no evaluations observed")
+				}
+				if !time.Now().After(deadline) {
+					if target.getScaleCalled() || handler.getState() != StateCooldown {
+						t.Fatal("restored cooldown did not suppress scaling before its deadline")
+					}
+
+					time.Sleep(time.Until(deadline))
+					synctest.Wait()
+					if target.getScaleCalled() {
+						t.Fatal("restored cooldown allowed Scale at its deadline")
+					}
+
+					time.Sleep(handler.policy.EvaluationInterval)
+					synctest.Wait()
+				}
+				if !target.getScaleCalled() {
+					t.Fatal("restored cooldown did not allow Scale after its deadline")
+				}
+				if handler.getState() != StateCooldown {
+					t.Fatalf("completed scale did not start a new cooldown: state=%v", handler.getState())
+				}
+				if got, want := handler.getOutOfCooldownOn(), time.Now().Add(cooldownOnScaleUp); !got.Equal(want) {
+					t.Fatalf("new cooldown deadline=%s want=%s", got, want)
+				}
+			})
+		})
 	}
 }
 
 func TestNewPolicyHandlerHasNoStaleRestoreTimer(t *testing.T) {
-	now := time.Now().UTC()
-	handler, _ := restoredCooldownHandler(t, now, 200*time.Millisecond,
-		map[string]string{sdk.TargetStatusMetaKeyLastEvent: strconv.FormatInt(now.Add(-120*time.Millisecond).UnixNano(), 10)})
-	handler.updateState(StateScaling)
-	time.Sleep(200 * time.Millisecond)
-	if handler.getState() != StateScaling {
-		t.Fatalf("constructor timer reset a newer state: %v", handler.getState())
-	}
+	synctest.Test(t, func(t *testing.T) {
+		last := time.Now().Add(-120 * time.Millisecond)
+		handler, _ := restoredCooldownHandler(t, time.Second, 200*time.Millisecond,
+			map[string]string{sdk.TargetStatusMetaKeyLastEvent: strconv.FormatInt(last.UnixNano(), 10)})
+		handler.updateState(StateScaling)
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if handler.getState() != StateScaling {
+			t.Fatalf("constructor timer reset a newer state: %v", handler.getState())
+		}
+	})
 }
