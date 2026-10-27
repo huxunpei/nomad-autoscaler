@@ -1,0 +1,30 @@
+name: PR 1362 cooldown validation
+on:
+  push:
+    branches:
+      - codex/pr1362-validation-20261027
+permissions:
+  contents: read
+jobs:
+  cooldown:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      GOMAXPROCS: '2'
+      GOGC: '50'
+      GOMEMLIMIT: 6GiB
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Check formatting
+        run: |
+          files=$(gofmt -l policy/cooldown_restore_regression_test.go policy/handler.go policy/handler_test.go)
+          test -z "$files" || { printf '%s\n' "$files"; exit 1; }
+      - name: Run regressions, policy suite, race, vet, and negative controls
+        run: python3 .github/pr1362_validation.py

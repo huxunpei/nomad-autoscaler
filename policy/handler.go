@@ -671,13 +671,6 @@ func (h *Handler) updateOutOfCooldownOn(ooc time.Time) {
 	h.outOfCooldownOn = ooc
 }
 
-// calculateRemainingCooldown calculates the remaining cooldown based on the
-// time since the last event. The remaining period can be negative, indicating
-// no cooldown period is required.
-func calculateRemainingCooldown(cd time.Duration, ts, lastEvent int64) time.Duration {
-	return cd - time.Duration(ts-lastEvent)
-}
-
 type checkResult struct {
 	action  *sdk.ScalingAction
 	handler checker
